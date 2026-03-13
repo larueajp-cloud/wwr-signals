@@ -5,11 +5,10 @@ import { useState, useEffect, useCallback, useRef } from "react";
 // ═══════════════════════════════════════════════════════════════
 // WWR SIGNAL DASHBOARD — Wickless Wave Rider
 // Mobile-first PWA for live MNQ trading signals
+// Polls /api/webhook for live signals from TradingView
 // ═══════════════════════════════════════════════════════════════
 
-const STORAGE_KEY = "wwr-signals";
-const BIAS_KEY = "wwr-bias";
-const STATS_KEY = "wwr-stats";
+const POLL_INTERVAL = 2000; // check for new signals every 2 seconds
 
 // Sound generation using Web Audio API
 const playSound = (type) => {
@@ -44,139 +43,91 @@ const playSound = (type) => {
   }
 };
 
-// Format timestamp
 const formatTime = (ts) => {
   const d = new Date(ts);
   return d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", second: "2-digit", hour12: true });
 };
-const formatDate = (ts) => {
-  const d = new Date(ts);
-  return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
-};
-
-// Demo signal generator for preview
-const generateDemoSignal = (signals) => {
-  const actions = ["buy", "sell", "exit"];
-  const action = actions[Math.floor(Math.random() * actions.length)];
-  const basePrice = 24400 + (Math.random() - 0.5) * 400;
-  const signal = {
-    id: Date.now(),
-    timestamp: Date.now(),
-    ticker: "MNQ",
-    action,
-    sentiment: action === "buy" ? "bullish" : action === "sell" ? "bearish" : "flat",
-    signalPrice: Math.round(basePrice * 100) / 100,
-    stopLoss: action !== "exit" ? Math.round((basePrice + (action === "sell" ? 1 : -1) * 120) * 100) / 100 : null,
-    comment: action === "buy" ? "Pullback entry" : action === "sell" ? "Pullback entry" : "Signal flip",
-  };
-  return signal;
-};
 
 export default function WWRDashboard() {
   const [signals, setSignals] = useState([]);
-  const [bias, setBias] = useState("neutral"); // bullish, bearish, neutral
-  const [position, setPosition] = useState("flat"); // long, short, flat
+  const [bias, setBias] = useState("neutral");
+  const [position, setPosition] = useState("flat");
   const [entryPrice, setEntryPrice] = useState(null);
   const [soundEnabled, setSoundEnabled] = useState(true);
   const [connected, setConnected] = useState(false);
   const [lastUpdate, setLastUpdate] = useState(null);
   const [showSetup, setShowSetup] = useState(false);
-  const [demoMode, setDemoMode] = useState(true);
   const [pulseAction, setPulseAction] = useState(null);
-  const signalListRef = useRef(null);
+  const lastSignalId = useRef(0);
+  const prevSignalCount = useRef(0);
 
-  // Load saved state
+  // Poll the API for new signals
   useEffect(() => {
-    const loadState = async () => {
+    let active = true;
+
+    const poll = async () => {
       try {
-        const savedSignals = await window.storage.get(STORAGE_KEY);
-        if (savedSignals?.value) setSignals(JSON.parse(savedSignals.value));
-      } catch (e) {}
-      try {
-        const savedBias = await window.storage.get(BIAS_KEY);
-        if (savedBias?.value) {
-          const b = JSON.parse(savedBias.value);
-          setBias(b.bias || "neutral");
-          setPosition(b.position || "flat");
-          setEntryPrice(b.entryPrice || null);
+        const since = lastSignalId.current > 0 ? `?since=${lastSignalId.current}` : "";
+        const res = await fetch(`/api/webhook${since}`);
+        if (!res.ok) throw new Error("API error");
+        const data = await res.json();
+
+        if (!active) return;
+        setConnected(true);
+
+        // Update state from server
+        setBias(data.bias || "neutral");
+        setPosition(data.position || "flat");
+        setEntryPrice(data.entryPrice || null);
+
+        // Process new signals
+        if (data.signals && data.signals.length > 0) {
+          const latestId = data.signals[0]?.id || 0;
+
+          if (latestId > lastSignalId.current && lastSignalId.current > 0) {
+            // New signal arrived — play sound
+            const newSig = data.signals[0];
+            if (soundEnabled) {
+              if (newSig.action === "buy") playSound("long");
+              else if (newSig.action === "sell") playSound("short");
+              else playSound("exit");
+            }
+            setPulseAction(newSig.action === "buy" ? "long" : newSig.action === "sell" ? "short" : "exit");
+            setTimeout(() => setPulseAction(null), 2000);
+          }
+
+          lastSignalId.current = latestId;
+          setLastUpdate(Date.now());
+
+          // Merge new signals with existing (on first load, replace entirely)
+          if (prevSignalCount.current === 0) {
+            setSignals(data.signals);
+          } else {
+            setSignals((prev) => {
+              const existingIds = new Set(prev.map((s) => s.id));
+              const newOnes = data.signals.filter((s) => !existingIds.has(s.id));
+              return [...newOnes, ...prev].slice(0, 200);
+            });
+          }
+          prevSignalCount.current = data.totalSignals;
         }
-      } catch (e) {}
+      } catch (e) {
+        if (active) setConnected(false);
+      }
     };
-    loadState();
-  }, []);
 
-  // Save signals when they change
-  useEffect(() => {
-    const save = async () => {
-      try {
-        await window.storage.set(STORAGE_KEY, JSON.stringify(signals.slice(0, 100)));
-      } catch (e) {}
+    poll(); // initial fetch
+    const interval = setInterval(poll, POLL_INTERVAL);
+    return () => {
+      active = false;
+      clearInterval(interval);
     };
-    if (signals.length > 0) save();
-  }, [signals]);
-
-  // Save bias state
-  useEffect(() => {
-    const save = async () => {
-      try {
-        await window.storage.set(BIAS_KEY, JSON.stringify({ bias, position, entryPrice }));
-      } catch (e) {}
-    };
-    save();
-  }, [bias, position, entryPrice]);
-
-  // Process incoming signal
-  const processSignal = useCallback((signal) => {
-    setSignals((prev) => [signal, ...prev].slice(0, 200));
-    setLastUpdate(Date.now());
-
-    if (signal.action === "buy" && signal.sentiment === "bullish") {
-      setBias("bullish");
-      setPosition("long");
-      setEntryPrice(signal.signalPrice);
-      if (soundEnabled) playSound("long");
-      setPulseAction("long");
-    } else if (signal.action === "sell" && signal.sentiment === "bearish") {
-      setBias("bearish");
-      setPosition("short");
-      setEntryPrice(signal.signalPrice);
-      if (soundEnabled) playSound("short");
-      setPulseAction("short");
-    } else if (signal.action === "exit") {
-      setPosition("flat");
-      setEntryPrice(null);
-      if (soundEnabled) playSound("exit");
-      setPulseAction("exit");
-    }
-
-    setTimeout(() => setPulseAction(null), 2000);
   }, [soundEnabled]);
 
-  // Demo mode: generate a signal every 8 seconds
-  useEffect(() => {
-    if (!demoMode) return;
-    setConnected(true);
-    const interval = setInterval(() => {
-      const sig = generateDemoSignal(signals);
-      processSignal(sig);
-    }, 8000);
-    return () => clearInterval(interval);
-  }, [demoMode, processSignal, signals]);
-
-  // Calculate stats from signal history
-  const stats = (() => {
-    const trades = signals.filter((s) => s.action !== "exit");
-    return {
-      total: signals.length,
-      buys: signals.filter((s) => s.action === "buy").length,
-      sells: signals.filter((s) => s.action === "sell").length,
-      exits: signals.filter((s) => s.action === "exit").length,
-    };
-  })();
-
-  const clearHistory = async () => {
-    setSignals([]);
-    try { await window.storage.delete(STORAGE_KEY); } catch (e) {}
+  const stats = {
+    total: signals.length,
+    buys: signals.filter((s) => s.action === "buy").length,
+    sells: signals.filter((s) => s.action === "sell").length,
   };
 
   const biasColor = bias === "bullish" ? "#26a69a" : bias === "bearish" ? "#ef5350" : "#555e7e";
@@ -203,7 +154,7 @@ export default function WWRDashboard() {
 
       <div style={{ position: "relative", zIndex: 1, padding: "0 16px 100px" }}>
 
-        {/* ── Header ── */}
+        {/* Header */}
         <div style={{
           padding: "20px 0 16px",
           borderBottom: "1px solid #151a28",
@@ -224,7 +175,6 @@ export default function WWRDashboard() {
             </div>
           </div>
           <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-            {/* Sound toggle */}
             <button
               onClick={() => setSoundEnabled(!soundEnabled)}
               style={{
@@ -236,9 +186,8 @@ export default function WWRDashboard() {
                 alignItems: "center", justifyContent: "center",
               }}
             >
-              {soundEnabled ? "🔊" : "🔇"}
+              {soundEnabled ? "\uD83D\uDD0A" : "\uD83D\uDD07"}
             </button>
-            {/* Connection indicator */}
             <div style={{
               width: 10, height: 10, borderRadius: "50%",
               background: connected ? "#26a69a" : "#ef5350",
@@ -247,7 +196,7 @@ export default function WWRDashboard() {
           </div>
         </div>
 
-        {/* ── Bias Card ── */}
+        {/* Bias Card */}
         <div style={{
           margin: "20px 0",
           padding: "20px",
@@ -270,7 +219,7 @@ export default function WWRDashboard() {
                 letterSpacing: "-0.02em", lineHeight: 1,
                 textTransform: "uppercase",
               }}>
-                {bias === "bullish" ? "▲ BULL" : bias === "bearish" ? "▼ BEAR" : "— NEUTRAL"}
+                {bias === "bullish" ? "\u25B2 BULL" : bias === "bearish" ? "\u25BC BEAR" : "\u2014 NEUTRAL"}
               </div>
             </div>
             <div style={{ textAlign: "right" }}>
@@ -295,7 +244,7 @@ export default function WWRDashboard() {
           </div>
         </div>
 
-        {/* ── Quick Stats ── */}
+        {/* Quick Stats */}
         <div style={{
           display: "grid", gridTemplateColumns: "1fr 1fr 1fr",
           gap: 8, marginBottom: 20,
@@ -319,7 +268,7 @@ export default function WWRDashboard() {
           ))}
         </div>
 
-        {/* ── Signal Feed ── */}
+        {/* Signal Feed */}
         <div style={{
           display: "flex", justifyContent: "space-between", alignItems: "center",
           marginBottom: 12,
@@ -328,45 +277,33 @@ export default function WWRDashboard() {
             fontSize: 11, fontWeight: 600, textTransform: "uppercase",
             letterSpacing: "0.1em", color: "#555e7e",
           }}>
-            Signal Feed
+            Signal Feed {connected ? "(Live)" : "(Connecting...)"}
           </div>
-          <div style={{ display: "flex", gap: 8 }}>
-            {lastUpdate && (
-              <div style={{ fontSize: 10, color: "#3a4158" }}>
-                Last: {formatTime(lastUpdate)}
-              </div>
-            )}
-            <button
-              onClick={clearHistory}
-              style={{
-                fontSize: 10, color: "#555e7e", background: "none",
-                border: "1px solid #1a1f30", borderRadius: 6,
-                padding: "2px 8px", cursor: "pointer",
-              }}
-            >
-              Clear
-            </button>
-          </div>
+          {lastUpdate && (
+            <div style={{ fontSize: 10, color: "#3a4158" }}>
+              Last: {formatTime(lastUpdate)}
+            </div>
+          )}
         </div>
 
-        <div ref={signalListRef} style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
           {signals.length === 0 ? (
             <div style={{
               padding: 40, textAlign: "center", color: "#3a4158",
               fontSize: 13, background: "#0b0d16", borderRadius: 12,
               border: "1px solid #151a28",
             }}>
-              {demoMode ? "Demo signals loading..." : "Waiting for signals..."}
+              Waiting for signals from TradingView...
               <br />
               <span style={{ fontSize: 11, marginTop: 8, display: "block" }}>
-                Signals will appear here when your strategy fires
+                The connection dot turns green when the API is reachable.
+                <br />Signals appear here when your strategy fires.
               </span>
             </div>
           ) : (
             signals.slice(0, 50).map((sig, i) => {
               const isBuy = sig.action === "buy";
               const isSell = sig.action === "sell";
-              const isExit = sig.action === "exit";
               const actionColor = isBuy ? "#26a69a" : isSell ? "#ef5350" : "#ffd54f";
               const actionBg = isBuy ? "#26a69a10" : isSell ? "#ef535010" : "#ffd54f10";
               const isNew = i === 0 && Date.now() - sig.timestamp < 3000;
@@ -384,7 +321,6 @@ export default function WWRDashboard() {
                     animation: isNew ? "slideIn 0.3s ease" : "none",
                   }}
                 >
-                  {/* Action icon */}
                   <div style={{
                     width: 40, height: 40, borderRadius: 10,
                     background: actionColor + "15",
@@ -392,10 +328,9 @@ export default function WWRDashboard() {
                     display: "flex", alignItems: "center", justifyContent: "center",
                     fontSize: 18, flexShrink: 0,
                   }}>
-                    {isBuy ? "▲" : isSell ? "▼" : "⊘"}
+                    {isBuy ? "\u25B2" : isSell ? "\u25BC" : "\u2298"}
                   </div>
 
-                  {/* Signal details */}
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
                       <div style={{
@@ -413,7 +348,7 @@ export default function WWRDashboard() {
                     </div>
                     <div style={{ display: "flex", justifyContent: "space-between", marginTop: 2 }}>
                       <div style={{ fontSize: 10, color: "#555e7e" }}>
-                        {sig.ticker} · {sig.comment || sig.sentiment}
+                        {sig.ticker} {sig.comment ? `\u00B7 ${sig.comment}` : ""}
                       </div>
                       <div style={{ fontSize: 10, color: "#3a4158", fontVariantNumeric: "tabular-nums" }}>
                         {formatTime(sig.timestamp)}
@@ -421,7 +356,7 @@ export default function WWRDashboard() {
                     </div>
                     {sig.stopLoss && (
                       <div style={{ fontSize: 10, color: "#ef535080", marginTop: 2 }}>
-                        SL: {sig.stopLoss.toFixed(2)}
+                        SL: {sig.stopLoss.toFixed ? sig.stopLoss.toFixed(2) : sig.stopLoss}
                       </div>
                     )}
                   </div>
@@ -431,7 +366,7 @@ export default function WWRDashboard() {
           )}
         </div>
 
-        {/* ── Setup Guide (collapsible) ── */}
+        {/* Setup Guide */}
         <div style={{ marginTop: 24 }}>
           <button
             onClick={() => setShowSetup(!showSetup)}
@@ -443,8 +378,8 @@ export default function WWRDashboard() {
               display: "flex", justifyContent: "space-between", alignItems: "center",
             }}
           >
-            <span>📡 Webhook Setup Guide</span>
-            <span style={{ transform: showSetup ? "rotate(180deg)" : "none", transition: "0.2s" }}>▾</span>
+            <span>{"\uD83D\uDCE1"} Webhook Setup Guide</span>
+            <span style={{ transform: showSetup ? "rotate(180deg)" : "none", transition: "0.2s" }}>{"\u25BE"}</span>
           </button>
 
           {showSetup && (
@@ -455,55 +390,45 @@ export default function WWRDashboard() {
               color: "#8890a8", lineHeight: 1.7,
             }}>
               <p style={{ marginBottom: 12, color: "#c8ccd8", fontWeight: 600 }}>
-                To receive live signals from TradingView:
+                Your webhook URL is:
+              </p>
+              <div style={{
+                background: "#151a28", padding: "10px 12px", borderRadius: 8,
+                fontSize: 11, color: "#ffd54f", marginBottom: 12, wordBreak: "break-all",
+              }}>
+                https://YOUR-APP.vercel.app/api/webhook
+              </div>
+              <p style={{ marginBottom: 8 }}>
+                <span style={{ color: "#26a69a", fontWeight: 700 }}>1.</span> In TradingView, edit your strategy alert
               </p>
               <p style={{ marginBottom: 8 }}>
-                <span style={{ color: "#26a69a", fontWeight: 700 }}>1.</span> Deploy this app to Vercel, Netlify, or any host
+                <span style={{ color: "#26a69a", fontWeight: 700 }}>2.</span> Add a second webhook notification with the URL above
               </p>
               <p style={{ marginBottom: 8 }}>
-                <span style={{ color: "#26a69a", fontWeight: 700 }}>2.</span> Add a serverless API route at <code style={{ background: "#151a28", padding: "2px 6px", borderRadius: 4, fontSize: 11 }}>/api/webhook</code> that receives POST requests and stores signals
+                <span style={{ color: "#26a69a", fontWeight: 700 }}>3.</span> Keep the alert message as: {"{{strategy.order.alert_message}}"}
               </p>
               <p style={{ marginBottom: 8 }}>
-                <span style={{ color: "#26a69a", fontWeight: 700 }}>3.</span> In TradingView, add a second webhook URL pointing to your app alongside TradersPost
-              </p>
-              <p style={{ marginBottom: 8 }}>
-                <span style={{ color: "#26a69a", fontWeight: 700 }}>4.</span> The alert message <code style={{ background: "#151a28", padding: "2px 6px", borderRadius: 4, fontSize: 11 }}>{"{{strategy.order.alert_message}}"}</code> sends the JSON your Pine Script already generates
+                <span style={{ color: "#26a69a", fontWeight: 700 }}>4.</span> Signals will appear here in real time
               </p>
               <p style={{ marginTop: 12, padding: "10px 12px", background: "#151a28", borderRadius: 8, fontSize: 11, color: "#ffd54f" }}>
-                💡 For push notifications, add a service worker and use the Web Push API with VAPID keys. This works on Android Chrome and iOS Safari 16.4+.
+                {"\uD83D\uDCA1"} Note: In-memory storage resets on each deploy. For persistent signals, connect a database like Supabase.
               </p>
-              <p style={{ marginTop: 12 }}>
-                <span style={{ color: "#26a69a", fontWeight: 700 }}>Demo mode</span> is currently active — generating sample signals to preview the UI.
-              </p>
-              <button
-                onClick={() => setDemoMode(!demoMode)}
-                style={{
-                  marginTop: 12, padding: "8px 16px",
-                  background: demoMode ? "#ef535020" : "#26a69a20",
-                  border: `1px solid ${demoMode ? "#ef535040" : "#26a69a40"}`,
-                  borderRadius: 8, color: demoMode ? "#ef5350" : "#26a69a",
-                  fontSize: 12, fontWeight: 600, cursor: "pointer", width: "100%",
-                }}
-              >
-                {demoMode ? "Stop Demo Mode" : "Start Demo Mode"}
-              </button>
             </div>
           )}
         </div>
 
-        {/* ── Footer ── */}
+        {/* Footer */}
         <div style={{
           marginTop: 24, paddingTop: 16,
           borderTop: "1px solid #151a28",
           textAlign: "center", fontSize: 10, color: "#3a4158",
         }}>
-          WWR Signal Dashboard · Wickless Wave Rider · MNQ
+          WWR Signal Dashboard {"\u00B7"} Wickless Wave Rider {"\u00B7"} MNQ
           <br />
-          Not financial advice · Trade at your own risk
+          Not financial advice {"\u00B7"} Trade at your own risk
         </div>
       </div>
 
-      {/* Slide-in animation */}
       <style>{`
         @keyframes slideIn {
           from { opacity: 0; transform: translateY(-10px); }
